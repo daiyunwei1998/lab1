@@ -87,7 +87,11 @@ class DiffusionModule(nn.Module):
         # DO NOT change the code outside this part.
         # Compute xt.
         alphas_prod_t = extract(self.var_scheduler.alphas_cumprod, t, x0)
-        xt = x0
+
+        mean = alphas_prod_t.sqrt() * x0  # use tensor .sqrt() instead of np.sqrt()
+        std = (1 - alphas_prod_t).sqrt()
+
+        xt = mean + std * noise
 
         #######################
 
