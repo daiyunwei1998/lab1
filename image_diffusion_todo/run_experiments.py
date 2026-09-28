@@ -24,17 +24,59 @@ Progress bars:
   outer tqdm bar across the whole experiment queue on top of that.
 
 Usage (from image_diffusion_todo/):
-    python run_experiments.py
+    python run_experiments.py                  # run the whole queue, one machine
+    python run_experiments.py --only linear_noise   # run just one experiment
+                                                       # (for one-pod-per-experiment setups)
+
+Google Drive sync (optional, off by default):
+  Set DRIVE_REMOTE below to an rclone remote:path (e.g. "gdrive:lab1-ckpts")
+  to have this script periodically upload the whole results/ folder to
+  Google Drive in the background, on top of everything train.py already
+  does locally -- train.py itself is never touched. This matters because
+  a rented pod's local disk disappears when the pod is terminated;
+  syncing during training (not just at the end) means an interrupted or
+  killed pod doesn't take its checkpoints with it.
+
+  One-time setup, before running this script:
+    curl https://rclone.org/install.sh | sudo bash
+    rclone config          # add a remote named e.g. "gdrive", type "drive"
+                            # (needs a one-time Google OAuth login; on a
+                            # headless pod, run `rclone authorize "drive"`
+                            # on a machine with a browser instead, and
+                            # paste the resulting token into `rclone config`
+                            # on the pod)
+  Then set DRIVE_REMOTE = "gdrive:lab1-ckpts" (or your own remote/path).
 """
+import argparse
 import json
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from tqdm import tqdm
 
 STATE_FILE = Path("results/experiment_state.json")
+
+# Set to an rclone "remote:path" (e.g. "gdrive:lab1-ckpts") to enable
+# periodic background syncing of results/ to Google Drive. Empty = disabled.
+DRIVE_REMOTE = ""
+SYNC_INTERVAL_SEC = 15 * 60  # how often to sync while experiments are running
+
+
+def _sync_once(quiet: bool = True) -> None:
+    if not DRIVE_REMOTE:
+        return
+    cmd = ["rclone", "copy", "results", DRIVE_REMOTE, "--update"]
+    if quiet:
+        cmd.append("-q")
+    subprocess.run(cmd)
+
+
+def _sync_loop(stop_event: threading.Event) -> None:
+    while not stop_event.wait(SYNC_INTERVAL_SEC):
+        _sync_once(quiet=True)
 
 # (label, mode, predictor, train_num_steps)
 # linear+noise is the one whose FID gets reported, so it gets the full
@@ -77,18 +119,54 @@ def run_one(label: str, mode: str, predictor: str, steps: int) -> int:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--only", type=str, default=None,
+        help="run just this one experiment label (see EXPERIMENTS), instead of "
+             "the whole queue -- for one-pod-per-experiment setups.",
+    )
+    args = parser.parse_args()
+
+    labels = [e[0] for e in EXPERIMENTS]
+    if args.only is not None and args.only not in labels:
+        sys.exit(f"--only '{args.only}' is not a known experiment label. "
+                  f"Choices: {', '.join(labels)}")
+
+    experiments = [e for e in EXPERIMENTS if e[0] == args.only] if args.only else EXPERIMENTS
+
     state = load_state()
 
-    pending = [e for e in EXPERIMENTS if state.get(e[0], {}).get("status") != "done"]
+    pending = [e for e in experiments if state.get(e[0], {}).get("status") != "done"]
     if not pending:
-        print(f"All {len(EXPERIMENTS)} experiments already marked done in {STATE_FILE}")
+        print(f"All {len(experiments)} experiment(s) already marked done in {STATE_FILE}")
         return
 
-    already_done = len(EXPERIMENTS) - len(pending)
+    already_done = len(experiments) - len(pending)
     if already_done:
         print(f"Resuming: {already_done}/{len(EXPERIMENTS)} experiments already done, "
               f"{len(pending)} left.")
 
+    stop_event = threading.Event()
+    sync_thread = None
+    if DRIVE_REMOTE:
+        print(f"Drive sync enabled: results/ -> {DRIVE_REMOTE} every "
+              f"{SYNC_INTERVAL_SEC // 60} min")
+        sync_thread = threading.Thread(target=_sync_loop, args=(stop_event,), daemon=True)
+        sync_thread.start()
+
+    try:
+        _run_queue(pending, state)
+    finally:
+        # Always fire one last, non-quiet sync on the way out -- success,
+        # Ctrl+C, or a failed run -- so whatever finished doesn't stay
+        # stranded on the pod's local disk only.
+        if DRIVE_REMOTE:
+            stop_event.set()
+            print("Running final Drive sync before exiting...")
+            _sync_once(quiet=False)
+
+
+def _run_queue(pending: list, state: dict) -> None:
     for label, mode, predictor, steps in tqdm(pending, desc="Experiments", unit="run"):
         print(f"\nStarting '{label}': mode={mode} predictor={predictor} steps={steps}")
         state[label] = {
