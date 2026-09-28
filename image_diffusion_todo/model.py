@@ -29,7 +29,16 @@ class DiffusionModule(nn.Module):
         # 2. Pass (x_t, timestep) into self.network, where the output should represent the clean sample x0_pred.
         # 3. Compute the loss as MSE(predicted x0_pred, ground-truth x0).
         ######################
-        loss = None
+        # 1. Sample a timestep and add noise to get (x_t, noise).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)
+        x_t, eps = self.var_scheduler.add_noise(x0, t, eps=noise)
+
+        # 2. Pass (x_t, timestep) into self.network -> predicted clean sample x0_pred.
+        x0_pred = self.network(x_t, t, class_label) if class_label is not None else self.network(x_t, t)
+
+        # 3. Compute the loss as MSE(predicted x0_pred, ground-truth x0).
+        loss = F.mse_loss(x0_pred, x0)
         return loss
 
     def get_loss_mean(self, x0, class_label=None, noise=None):
@@ -40,7 +49,32 @@ class DiffusionModule(nn.Module):
         # 3. Compute the *true* posterior mean from the closed-form DDPM formula (using x0, x_t, and scheduler terms).
         # 4. Compute the loss as MSE(predicted mean, true mean).
         ######################
-        loss = None
+        # 1. Sample a timestep and add noise to get (x_t, noise).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)
+        x_t, eps = self.var_scheduler.add_noise(x0, t, eps=noise)
+
+        # 2. Pass (x_t, timestep) into self.network -> predicted posterior mean mean_pred.
+        mean_pred = self.network(x_t, t, class_label) if class_label is not None else self.network(x_t, t)
+
+        # 3. Compute the *true* posterior mean from the closed-form DDPM formula.
+        beta_t           = extract(self.var_scheduler.betas,          t, x_t)
+        alpha_t          = extract(self.var_scheduler.alphas,         t, x_t)
+        alpha_bar_t      = extract(self.var_scheduler.alphas_cumprod, t, x_t)
+        t_prev           = (t - 1).clamp(min=0)
+        # `t == 0` has shape [B]; reshape to [B,1,1,1] before using it as a
+        # torch.where condition, so it aligns with the batch dim instead of
+        # broadcasting against the trailing (H, W) dims.
+        is_t0            = (t == 0).view(alpha_bar_t.shape)
+        alpha_bar_t_prev = torch.where(is_t0, torch.ones_like(alpha_bar_t),
+                                        extract(self.var_scheduler.alphas_cumprod, t_prev, x_t))
+        true_mean = (
+            (alpha_bar_t_prev.sqrt() * beta_t) / (1 - alpha_bar_t) * x0
+            + (alpha_t.sqrt() * (1 - alpha_bar_t_prev)) / (1 - alpha_bar_t) * x_t
+        )
+
+        # 4. Compute the loss as MSE(predicted mean, true mean).
+        loss = F.mse_loss(mean_pred, true_mean)
         return loss
     
     def get_loss(self, x0, class_label=None, noise=None):
