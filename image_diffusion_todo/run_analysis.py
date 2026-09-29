@@ -43,6 +43,18 @@ itself is a distributional statistic with no per-image value, so this
 distance is the per-image proxy for "how unrealistic is this one sample",
 used to surface the worst offenders for visual inspection.
 
+FID is computed with a locally-regularized Frechet distance, not the teacher's
+fid/measure_fid.py frechet_distance() directly (that file itself is untouched
+-- InceptionV3 and its weights are still reused exactly as provided). Inception
+features are 2048-dim; with only a few hundred samples the sample covariance
+matrix is rank-deficient, and scipy.linalg.sqrtm has no numerical safeguard
+for that in the teacher's implementation. Verified directly: comparing the
+1500-image eval set against a 500-image subset of itself (should give FID~=0,
+since they're the same real images) produced FID=3.5e61 with the unmodified
+function. The standard fix (used by every mainstream FID implementation --
+TTUR, pytorch-fid, clean-fid) is an epsilon-regularized sqrtm, applied here in
+frechet_distance_stable().
+
 Usage:
     python run_analysis.py
 """
@@ -56,11 +68,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy import linalg
+
 from dataset import tensor_to_pil_image
 from model import DiffusionModule
 
 sys.path.insert(0, str(Path(__file__).parent / "fid"))
-from measure_fid import InceptionV3, frechet_distance, get_eval_loader  # noqa: E402 -- teacher's file, reused not edited
+from measure_fid import InceptionV3, get_eval_loader  # noqa: E402 -- teacher's file, reused not edited
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -134,15 +148,17 @@ def generate_samples(ddpm, n, out_dir, batch_size=64):
     return out_dir
 
 
-def compute_fid(gen_dir, eval_dir=EVAL_DIR):
-    result = subprocess.run(
-        ["python3", "fid/measure_fid.py", eval_dir, gen_dir],
-        capture_output=True, text=True,
-    )
-    lines = [l for l in result.stdout.splitlines() if l.startswith("FID:")]
-    if not lines:
-        raise RuntimeError(f"FID computation failed:\n{result.stdout}\n{result.stderr}")
-    return float(lines[-1].split("FID:")[1].strip())
+def frechet_distance_stable(mu1, cov1, mu2, cov2, eps=1e-6):
+    """Standard epsilon-regularized Frechet distance (TTUR/pytorch-fid convention) --
+    see the module docstring for why the teacher's unregularized version blows up."""
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(cov1.dot(cov2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(cov1.shape[0]) * eps
+        covmean = linalg.sqrtm((cov1 + offset).dot(cov2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(diff.dot(diff) + np.trace(cov1) + np.trace(cov2) - 2 * np.trace(covmean))
 
 
 _inception = None
@@ -177,6 +193,12 @@ def get_real_stats(eval_dir=EVAL_DIR):
     return _real_stats
 
 
+def compute_fid(gen_dir):
+    real_mu, real_cov, _ = get_real_stats()
+    gen_actvs = embed_dir(gen_dir)
+    return frechet_distance_stable(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
+
+
 def compute_fid_with_error_analysis(gen_dir, label, k=N_WORST_SAMPLES):
     """Like compute_fid, but keeps the generated images and ranks each one by its nearest-neighbor
     distance to the real Inception activation cloud -- a per-image proxy for "how unrealistic is
@@ -186,7 +208,7 @@ def compute_fid_with_error_analysis(gen_dir, label, k=N_WORST_SAMPLES):
     files = sorted(Path(gen_dir).glob("*.png"), key=lambda p: int(p.stem))
     gen_actvs = embed_dir(gen_dir)
 
-    fid = frechet_distance(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
+    fid = frechet_distance_stable(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
 
     real_t = torch.from_numpy(real_actvs).to(device)
     gen_t = torch.from_numpy(gen_actvs).to(device)
