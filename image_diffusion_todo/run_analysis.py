@@ -36,6 +36,13 @@ single (config, step) FID computation -- not batched at the end -- so a pod
 dying mid-run doesn't lose already-computed results (this happened once
 already this session).
 
+Each config's final checkpoint additionally gets an error analysis: its 500
+generated images are kept (not deleted like curve-point samples) and ranked
+by nearest-neighbor distance to the real Inception activation cloud -- FID
+itself is a distributional statistic with no per-image value, so this
+distance is the per-image proxy for "how unrealistic is this one sample",
+used to surface the worst offenders for visual inspection.
+
 Usage:
     python run_analysis.py
 """
@@ -44,10 +51,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
+import numpy as np
 import torch
 from dataset import tensor_to_pil_image
 from model import DiffusionModule
+
+sys.path.insert(0, str(Path(__file__).parent / "fid"))
+from measure_fid import InceptionV3, frechet_distance, get_eval_loader  # noqa: E402 -- teacher's file, reused not edited
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -69,6 +82,8 @@ PREDICTOR_LABELS = ["linear_noise", "linear_x0", "linear_mean"]  # for the predi
 N_SAMPLES_FINAL = 500   # project's own FID convention (README default) -- for the headline table
 N_SAMPLES_CURVE = 150   # cheaper: the curve only needs to show the trend
 N_CURVE_POINTS = 13     # evenly-spaced checkpoints per config, not every saved step
+N_WORST_SAMPLES = 16    # per config, for the final-checkpoint error-analysis figure
+EVAL_DIR = "data/afhq/eval"
 
 
 def drive_ckpt_dir(label):
@@ -119,7 +134,7 @@ def generate_samples(ddpm, n, out_dir, batch_size=64):
     return out_dir
 
 
-def compute_fid(gen_dir, eval_dir="data/afhq/eval"):
+def compute_fid(gen_dir, eval_dir=EVAL_DIR):
     result = subprocess.run(
         ["python3", "fid/measure_fid.py", eval_dir, gen_dir],
         capture_output=True, text=True,
@@ -128,6 +143,71 @@ def compute_fid(gen_dir, eval_dir="data/afhq/eval"):
     if not lines:
         raise RuntimeError(f"FID computation failed:\n{result.stdout}\n{result.stderr}")
     return float(lines[-1].split("FID:")[1].strip())
+
+
+_inception = None
+_real_stats = None  # (mu, cov, activations) for the eval set -- same across every config, computed once
+
+
+def get_inception():
+    global _inception
+    if _inception is None:
+        _inception = InceptionV3(for_train=False)
+        ckpt = torch.load(Path(__file__).parent / "fid" / "afhq_inception_v3.ckpt", map_location="cpu")
+        _inception.load_state_dict(ckpt)
+        _inception = _inception.eval().to(device)
+    return _inception
+
+
+def embed_dir(image_dir, img_size=256, batch_size=64):
+    inception = get_inception()
+    loader = get_eval_loader(image_dir, img_size, batch_size)
+    actvs = []
+    with torch.no_grad():
+        for x in loader:
+            actvs.append(inception(x.to(device)))
+    return torch.cat(actvs, dim=0).cpu().numpy()
+
+
+def get_real_stats(eval_dir=EVAL_DIR):
+    global _real_stats
+    if _real_stats is None:
+        actvs = embed_dir(eval_dir)
+        _real_stats = (np.mean(actvs, axis=0), np.cov(actvs, rowvar=False), actvs)
+    return _real_stats
+
+
+def compute_fid_with_error_analysis(gen_dir, label, k=N_WORST_SAMPLES):
+    """Like compute_fid, but keeps the generated images and ranks each one by its nearest-neighbor
+    distance to the real Inception activation cloud -- a per-image proxy for "how unrealistic is
+    this sample", since FID itself is a distributional statistic and isn't defined per image.
+    Used only for each config's final checkpoint, where seeing the worst offenders matters."""
+    real_mu, real_cov, real_actvs = get_real_stats()
+    files = sorted(Path(gen_dir).glob("*.png"), key=lambda p: int(p.stem))
+    gen_actvs = embed_dir(gen_dir)
+
+    fid = frechet_distance(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
+
+    real_t = torch.from_numpy(real_actvs).to(device)
+    gen_t = torch.from_numpy(gen_actvs).to(device)
+    nn_dist = torch.cdist(gen_t, real_t).min(dim=1).values.cpu().numpy()
+
+    ranked = sorted(zip(files, nn_dist), key=lambda p: -p[1])
+    worst = ranked[:k]
+    worst_dir = f"{OUT_DIR}/worst_samples/{label}"
+    os.makedirs(worst_dir, exist_ok=True)
+    for f, _ in worst:
+        shutil.copy(f, f"{worst_dir}/{f.name}")
+
+    json.dump(
+        {
+            "fid": float(fid),
+            "worst": [{"file": f.name, "nn_distance": float(d)} for f, d in worst],
+            "per_image_nn_distance": {f.name: float(d) for f, d in zip(files, nn_dist)},
+        },
+        open(f"{OUT_DIR}/error_analysis_{label}.json", "w"), indent=2,
+    )
+    return float(fid)
 
 
 def all_ckpt_steps(label):
@@ -196,13 +276,19 @@ def process_checkpoint(label, step, is_final, is_progression_step, results):
     ddpm = load_checkpoint(d, f"step={step}.ckpt")
 
     if need_fid:
-        n_samples = N_SAMPLES_FINAL if is_final else N_SAMPLES_CURVE
-        gen_dir = f"/tmp/gen/{label}_{step}"
-        generate_samples(ddpm, n_samples, gen_dir)
-        fid = compute_fid(gen_dir)
+        if is_final:
+            # keep the generated images (under OUT_DIR, so the regular sync picks them up) --
+            # needed for the per-image error analysis, not just the scalar FID
+            gen_dir = f"{OUT_DIR}/final_samples/{label}"
+            generate_samples(ddpm, N_SAMPLES_FINAL, gen_dir)
+            fid = compute_fid_with_error_analysis(gen_dir, label)
+        else:
+            gen_dir = f"/tmp/gen/{label}_{step}"
+            generate_samples(ddpm, N_SAMPLES_CURVE, gen_dir)
+            fid = compute_fid(gen_dir)
+            shutil.rmtree(gen_dir, ignore_errors=True)
         results[label][str(step)] = fid
         print(f"[done] {label} step={step} FID={fid:.4f}", flush=True)
-        shutil.rmtree(gen_dir, ignore_errors=True)
         save_and_sync(results)  # incremental: survives a mid-run crash
 
     if need_predictor_samples:
