@@ -80,8 +80,8 @@ CONFIGS = {
 PREDICTOR_LABELS = ["linear_noise", "linear_x0", "linear_mean"]  # for the predictor-comparison figure
 
 N_SAMPLES_FINAL = 500   # project's own FID convention (README default) -- for the headline table
-N_SAMPLES_CURVE = 150   # cheaper: the curve only needs to show the trend
-N_CURVE_POINTS = 13     # evenly-spaced checkpoints per config, not every saved step
+N_SAMPLES_CURVE = 100   # cheaper: the curve only needs to show the trend
+N_CURVE_POINTS = 8      # evenly-spaced checkpoints per config, not every saved step
 N_WORST_SAMPLES = 16    # per config, for the final-checkpoint error-analysis figure
 EVAL_DIR = "data/afhq/eval"
 
