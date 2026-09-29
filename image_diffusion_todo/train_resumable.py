@@ -64,17 +64,34 @@ matplotlib.use("Agg")
 def sync_to_drive(drive_remote: str, step: int, final: bool = False) -> None:
     if not drive_remote:
         return
-    result = subprocess.run(
-        ["rclone", "copy", "results", drive_remote, "--update", "-q"]
-    )
+    cmd = ["rclone", "copy", "results", drive_remote, "--update", "-q",
+           "--low-level-retries", "3", "--retries", "1"]
+    if not final:
+        # Periodic syncs are fire-and-forget: a Drive-side hiccup (rate limits on
+        # rclone's shared client_id, a stalled connection -- no timeout on rclone's
+        # own retry loop otherwise) must never block the training loop. We accept
+        # not knowing this particular sync's outcome in exchange for training never
+        # freezing on it; the NEXT periodic sync (or the final one) picks up
+        # whatever this one missed, since --update only copies what's actually new.
+        subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"SYNC started (background, not awaited) at step {step}")
+        return
+    # The final sync must actually be confirmed before declaring it safe to
+    # delete the instance, so this one blocks -- but with a hard timeout, so a
+    # hung connection can't freeze the script forever with no signal either way.
+    try:
+        result = subprocess.run(cmd, timeout=600)
+    except subprocess.TimeoutExpired:
+        print(f"SYNC FAILED at step {step} (timed out after 600s) -- "
+              f"NOT safe to delete the instance yet.")
+        return
     if result.returncode != 0:
         print(f"SYNC FAILED at step {step} (rclone exit {result.returncode}) -- "
-              f"NOT safe to delete the instance yet, retrying next checkpoint.")
+              f"NOT safe to delete the instance yet.")
         return
-    if final:
-        print("FINAL SYNC COMPLETE -- SAFE TO DELETE INSTANCE")
-    else:
-        print(f"SYNC OK at step {step}")
+    print("FINAL SYNC COMPLETE -- SAFE TO DELETE INSTANCE")
 
 
 def main(args):
