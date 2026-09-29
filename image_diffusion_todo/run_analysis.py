@@ -63,9 +63,17 @@ eigh (see frechet_distance_stable()) rather than the fragile Schur-based
 sqrtm. Verified this gives FID=8.18 on the same real-vs-real-subset check --
 consistent with the PDF's own reference scale.
 
+Checkpoint downloads are prefetched one step ahead: while the GPU is busy
+sampling/scoring the current checkpoint, a background thread downloads the
+next one, so the GPU is never idle waiting on network I/O (each download is
+only ~28s against several minutes of GPU work per checkpoint, but under
+Drive rate-limiting it can take much longer, and there's no reason to pay
+that cost serially when it fully overlaps with unrelated GPU work).
+
 Usage:
     python run_analysis.py
 """
+import concurrent.futures
 import json
 import os
 import re
@@ -126,8 +134,27 @@ def fetch_file(remote_dir, filename):
     return local_path
 
 
-def load_checkpoint(remote_dir, filename):
-    local_path = fetch_file(remote_dir, filename)
+_prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_prefetch_cache = {}  # (remote_dir, filename) -> Future[local_path]; depth-1 pipeline
+
+
+def prefetch(remote_dir, filename):
+    """Kicks off a background download that overlaps with the caller's subsequent GPU work.
+    A no-op if this file is already downloading or already queued."""
+    key = (remote_dir, filename)
+    if key not in _prefetch_cache:
+        _prefetch_cache[key] = _prefetch_executor.submit(fetch_file, remote_dir, filename)
+
+
+def get_checkpoint_path(remote_dir, filename):
+    """Returns the local path for a checkpoint, blocking only if it wasn't already prefetched."""
+    key = (remote_dir, filename)
+    if key in _prefetch_cache:
+        return _prefetch_cache.pop(key).result()
+    return fetch_file(remote_dir, filename)
+
+
+def load_from_path(local_path):
     try:
         dic = torch.load(local_path, map_location=device, weights_only=False)
     finally:
@@ -301,10 +328,10 @@ def already_have_images(target_dir, n=8):
     ) >= n
 
 
-def process_checkpoint(label, step, is_final, is_progression_step, results):
-    """One download, one load -- covers the FID curve point, the predictor-comparison
-    samples (if this is the final checkpoint of a predictor-compared config), and the
-    progression samples (if this step was chosen for linear_noise's progression figure)."""
+def needs_processing(label, step, is_final, is_progression_step, results):
+    """What this (label, step) still needs -- checked both to decide whether to bother
+    downloading/prefetching it at all, and (again, cheaply) right before doing the GPU work,
+    in case something changed in between."""
     need_fid = str(step) not in results[label]
     need_predictor_samples = (
         is_final and label in PREDICTOR_LABELS
@@ -314,16 +341,14 @@ def process_checkpoint(label, step, is_final, is_progression_step, results):
         label == "linear_noise" and is_progression_step
         and not already_have_images(f"{OUT_DIR}/progression/step={step}")
     )
-    if not (need_fid or need_predictor_samples or need_progression):
-        print(f"[skip] {label} step={step} (nothing new needed)")
-        return
+    return need_fid, need_predictor_samples, need_progression
 
-    print(f"[load] {label} step={step} "
-          f"(fid={need_fid} predictor_samples={need_predictor_samples} progression={need_progression})",
-          flush=True)
-    d = drive_ckpt_dir(label)
-    ddpm = load_checkpoint(d, f"step={step}.ckpt")
 
+def process_checkpoint(ddpm, label, step, is_final, need_fid, need_predictor_samples, need_progression, results):
+    """Covers the FID curve point, the predictor-comparison samples (if this is the final
+    checkpoint of a predictor-compared config), and the progression samples (if this step was
+    chosen for linear_noise's progression figure) -- for an already-downloaded, already-loaded
+    checkpoint."""
     if need_fid:
         if is_final:
             # keep the generated images (under OUT_DIR, so the regular sync picks them up) --
@@ -352,16 +377,11 @@ def process_checkpoint(label, step, is_final, is_progression_step, results):
         print(f"[done] {label} progression step={step} -> {target}", flush=True)
         rclone_sync(target, f"{DRIVE_REMOTE}/progression/step={step}")
 
-    del ddpm
-    torch.cuda.empty_cache()
 
-
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    results = load_results()
-    for label in CONFIGS:
-        results.setdefault(label, {})
-
+def build_tasks():
+    """All (label, step) pairs across every config, computed upfront -- lets the prefetch
+    pipeline look ahead across config boundaries too, not just within one config's steps."""
+    tasks = []
     for label in CONFIGS:
         steps = all_ckpt_steps(label)
         if not steps:
@@ -370,14 +390,47 @@ def main():
         final_step = steps[-1]
         prog_steps = progression_steps_for(steps) if label == "linear_noise" else set()
         curve_steps = set(evenly_spaced(steps, N_CURVE_POINTS)) | {final_step} | prog_steps
-
         for step in sorted(curve_steps):
-            process_checkpoint(
-                label, step,
-                is_final=(step == final_step),
-                is_progression_step=(step in prog_steps),
-                results=results,
-            )
+            tasks.append({
+                "label": label, "step": step,
+                "is_final": step == final_step,
+                "is_progression_step": step in prog_steps,
+            })
+    return tasks
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    results = load_results()
+    for label in CONFIGS:
+        results.setdefault(label, {})
+
+    tasks = build_tasks()
+    for i, task in enumerate(tasks):
+        label, step, is_final, is_prog = task["label"], task["step"], task["is_final"], task["is_progression_step"]
+        need_fid, need_pred, need_prog = needs_processing(label, step, is_final, is_prog, results)
+        if not (need_fid or need_pred or need_prog):
+            print(f"[skip] {label} step={step} (nothing new needed)")
+            continue
+
+        remote_dir = drive_ckpt_dir(label)
+        filename = f"step={step}.ckpt"
+        local_path = get_checkpoint_path(remote_dir, filename)  # blocks only if not prefetched
+
+        # kick off the next NEEDED checkpoint's download now, so it overlaps with this one's GPU work
+        for nxt in tasks[i + 1:]:
+            nxt_fid, nxt_pred, nxt_prog = needs_processing(
+                nxt["label"], nxt["step"], nxt["is_final"], nxt["is_progression_step"], results)
+            if nxt_fid or nxt_pred or nxt_prog:
+                prefetch(drive_ckpt_dir(nxt["label"]), f"step={nxt['step']}.ckpt")
+                break
+
+        print(f"[load] {label} step={step} (fid={need_fid} predictor_samples={need_pred} progression={need_prog})",
+              flush=True)
+        ddpm = load_from_path(local_path)
+        process_checkpoint(ddpm, label, step, is_final, need_fid, need_pred, need_prog, results)
+        del ddpm
+        torch.cuda.empty_cache()
 
     print("ALL DONE")
 
