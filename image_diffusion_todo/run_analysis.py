@@ -21,9 +21,14 @@ images) -- not re-downloaded once per output.
 
 "Final FID" is just the last point on that config's FID-vs-step curve, not a
 separately-computed number -- last.ckpt and the final step=N.ckpt are
-identical (train_resumable.py saves both together at the end of training), and
-500 samples is the project's own FID convention (README default), not the
-2048 used for Task 1's chamfer distance.
+identical (train_resumable.py saves both together at the end of training).
+500 samples (the project's own FID convention, README default) is used only
+for that final point; other curve points use a smaller sample count -- the
+curve only needs to show the trend, not be individually publication-grade,
+and computing full 500-sample FID at every one of the ~160 checkpoints saved
+across all 5 configs would take about two days on this GPU. Checkpoints are
+also subsampled to ~13 evenly spaced steps per config rather than every saved
+step, for the same reason.
 
 Resumable, same philosophy as train_resumable.py: results already present in
 the synced JSON are skipped, and the JSON is re-synced to Drive after every
@@ -61,7 +66,9 @@ CONFIGS = {
 }
 PREDICTOR_LABELS = ["linear_noise", "linear_x0", "linear_mean"]  # for the predictor-comparison figure
 
-N_SAMPLES = 500   # project's own FID convention (README default), used for every FID computation
+N_SAMPLES_FINAL = 500   # project's own FID convention (README default) -- for the headline table
+N_SAMPLES_CURVE = 150   # cheaper: the curve only needs to show the trend
+N_CURVE_POINTS = 13     # evenly-spaced checkpoints per config, not every saved step
 
 
 def drive_ckpt_dir(label):
@@ -145,11 +152,18 @@ def save_and_sync(results):
     subprocess.run(["rclone", "copy", OUT_DIR, DRIVE_REMOTE, "--update", "-q"])
 
 
-def progression_steps_for(steps_avail):
-    chosen = steps_avail[:: max(1, len(steps_avail) // 5)][:5]
+def evenly_spaced(steps_avail, n):
+    """Picks n evenly-spaced steps from an ascending list, always including the last one."""
+    if len(steps_avail) <= n:
+        return list(steps_avail)
+    chosen = steps_avail[:: max(1, len(steps_avail) // n)][:n]
     if steps_avail[-1] not in chosen:
         chosen[-1] = steps_avail[-1]
-    return set(chosen)
+    return chosen
+
+
+def progression_steps_for(steps_avail):
+    return set(evenly_spaced(steps_avail, 5))
 
 
 def already_have_images(target_dir, n=8):
@@ -182,8 +196,9 @@ def process_checkpoint(label, step, is_final, is_progression_step, results):
     ddpm = load_checkpoint(d, f"step={step}.ckpt")
 
     if need_fid:
+        n_samples = N_SAMPLES_FINAL if is_final else N_SAMPLES_CURVE
         gen_dir = f"/tmp/gen/{label}_{step}"
-        generate_samples(ddpm, N_SAMPLES, gen_dir)
+        generate_samples(ddpm, n_samples, gen_dir)
         fid = compute_fid(gen_dir)
         results[label][str(step)] = fid
         print(f"[done] {label} step={step} FID={fid:.4f}", flush=True)
@@ -221,8 +236,9 @@ def main():
             continue
         final_step = steps[-1]
         prog_steps = progression_steps_for(steps) if label == "linear_noise" else set()
+        curve_steps = set(evenly_spaced(steps, N_CURVE_POINTS)) | {final_step} | prog_steps
 
-        for step in steps:
+        for step in sorted(curve_steps):
             process_checkpoint(
                 label, step,
                 is_final=(step == final_step),
