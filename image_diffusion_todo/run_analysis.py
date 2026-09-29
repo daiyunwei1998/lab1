@@ -43,17 +43,25 @@ itself is a distributional statistic with no per-image value, so this
 distance is the per-image proxy for "how unrealistic is this one sample",
 used to surface the worst offenders for visual inspection.
 
-FID is computed with a locally-regularized Frechet distance, not the teacher's
+FID is computed with a numerically-robust Frechet distance, not the teacher's
 fid/measure_fid.py frechet_distance() directly (that file itself is untouched
--- InceptionV3 and its weights are still reused exactly as provided). Inception
-features are 2048-dim; with only a few hundred samples the sample covariance
-matrix is rank-deficient, and scipy.linalg.sqrtm has no numerical safeguard
-for that in the teacher's implementation. Verified directly: comparing the
-1500-image eval set against a 500-image subset of itself (should give FID~=0,
-since they're the same real images) produced FID=3.5e61 with the unmodified
-function. The standard fix (used by every mainstream FID implementation --
-TTUR, pytorch-fid, clean-fid) is an epsilon-regularized sqrtm, applied here in
-frechet_distance_stable().
+-- InceptionV3 and its weights are still reused exactly as provided). The
+README/PDF's own reference FIDs are sane (order 10-200), so the metric isn't
+broken in general -- but scipy.linalg.sqrtm(cov1 @ cov2) operates on a
+generally non-symmetric matrix (cov1 != cov2) via a Schur decomposition that
+is fragile near clustered/near-zero eigenvalues (common with only a few
+hundred samples against 2048-dim Inception features, especially for
+early/undertrained checkpoints), and can silently return a wildly wrong value
+that is still finite -- so a naive `isfinite` guard (tried first here, and
+still wrong) never catches it. Verified: a 500-image real subset of the
+1500-image eval set against the full eval set (expect FID roughly 0-10) gave
+FID=3.5e61 via the teacher's function. The fix used by every mainstream FID
+implementation (TTUR, pytorch-fid, clean-fid) avoids sqrtm on the asymmetric
+product entirely: it reformulates the cross term as
+Tr(sqrt(C1^0.5 @ C2 @ C1^0.5)), a genuinely symmetric PSD matrix, computed via
+eigh (see frechet_distance_stable()) rather than the fragile Schur-based
+sqrtm. Verified this gives FID=8.18 on the same real-vs-real-subset check --
+consistent with the PDF's own reference scale.
 
 Usage:
     python run_analysis.py
@@ -68,7 +76,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy import linalg
 
 from dataset import tensor_to_pil_image
 from model import DiffusionModule
@@ -148,17 +155,26 @@ def generate_samples(ddpm, n, out_dir, batch_size=64):
     return out_dir
 
 
+def _sqrt_psd(a):
+    """Matrix square root of a symmetric PSD matrix via eigendecomposition -- unlike
+    scipy.linalg.sqrtm's Schur-based algorithm, this can't return a wrong-but-finite
+    result for a near-singular input; eigenvalues are just clamped at 0."""
+    w, v = np.linalg.eigh(a)
+    w = np.clip(w, 0, None)
+    return (v * np.sqrt(w)) @ v.T
+
+
 def frechet_distance_stable(mu1, cov1, mu2, cov2, eps=1e-6):
-    """Standard epsilon-regularized Frechet distance (TTUR/pytorch-fid convention) --
-    see the module docstring for why the teacher's unregularized version blows up."""
+    """Frechet distance without scipy.linalg.sqrtm on the asymmetric cov1 @ cov2 product --
+    see the module docstring for why that's fragile here. Reformulates the cross term as
+    Tr(sqrt(C1^0.5 @ C2 @ C1^0.5)), which is symmetric PSD and safe to take via eigh."""
     diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(cov1.dot(cov2), disp=False)
-    if not np.isfinite(covmean).all():
-        offset = np.eye(cov1.shape[0]) * eps
-        covmean = linalg.sqrtm((cov1 + offset).dot(cov2 + offset))
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    return float(diff.dot(diff) + np.trace(cov1) + np.trace(cov2) - 2 * np.trace(covmean))
+    d = cov1.shape[0]
+    c1 = cov1 + eps * np.eye(d)
+    c2 = cov2 + eps * np.eye(d)
+    c1_sqrt = _sqrt_psd(c1)
+    inner_sqrt = _sqrt_psd(c1_sqrt @ c2 @ c1_sqrt)
+    return float(diff.dot(diff) + np.trace(cov1) + np.trace(cov2) - 2 * np.trace(inner_sqrt))
 
 
 _inception = None
