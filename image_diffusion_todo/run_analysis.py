@@ -119,7 +119,7 @@ def fetch_file(remote_dir, filename):
     result = subprocess.run(
         ["rclone", "copyto", f"{remote_dir}/{filename}", local_path,
          "--retries", "5", "--low-level-retries", "10"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=300,
     )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to fetch {remote_dir}/{filename}:\n{result.stderr}")
@@ -253,7 +253,7 @@ def all_ckpt_steps(label):
     which checkpoints exist."""
     remote_dir = drive_ckpt_dir(label)
     result = subprocess.run(["rclone", "lsf", remote_dir, "--include", "step=*.ckpt"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, timeout=60)
     names = [l.strip() for l in result.stdout.splitlines() if l.strip()]
     return sorted(int(re.search(r"step=(\d+)\.ckpt", n).group(1)) for n in names)
 
@@ -264,10 +264,21 @@ def load_results():
     return {}
 
 
+def rclone_sync(local, remote, timeout=90):
+    """A blocking rclone copy with a hard timeout -- without one, a Drive rate-limit stall
+    blocks the whole script indefinitely (hit this directly: save_and_sync's copy hung for
+    26+ minutes with 0% GPU util before being killed manually). A timed-out sync isn't fatal:
+    results are already on local disk, and the next sync call retries them."""
+    try:
+        subprocess.run(["rclone", "copy", local, remote, "--update", "-q"], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"[warn] rclone sync {local} -> {remote} timed out after {timeout}s, continuing", flush=True)
+
+
 def save_and_sync(results):
     os.makedirs(OUT_DIR, exist_ok=True)
     json.dump(results, open(RESULTS_JSON, "w"), indent=2)
-    subprocess.run(["rclone", "copy", OUT_DIR, DRIVE_REMOTE, "--update", "-q"])
+    rclone_sync(OUT_DIR, DRIVE_REMOTE)
 
 
 def evenly_spaced(steps_avail, n):
@@ -333,15 +344,13 @@ def process_checkpoint(label, step, is_final, is_progression_step, results):
         target = f"{OUT_DIR}/predictor_samples/{CONFIGS[label]['predictor']}"
         generate_samples(ddpm, 8, target, batch_size=8)
         print(f"[done] {label} predictor samples -> {target}", flush=True)
-        subprocess.run(["rclone", "copy", target, f"{DRIVE_REMOTE}/predictor_samples/{CONFIGS[label]['predictor']}",
-                         "--update", "-q"])
+        rclone_sync(target, f"{DRIVE_REMOTE}/predictor_samples/{CONFIGS[label]['predictor']}")
 
     if need_progression:
         target = f"{OUT_DIR}/progression/step={step}"
         generate_samples(ddpm, 8, target, batch_size=8)
         print(f"[done] {label} progression step={step} -> {target}", flush=True)
-        subprocess.run(["rclone", "copy", target, f"{DRIVE_REMOTE}/progression/step={step}",
-                         "--update", "-q"])
+        rclone_sync(target, f"{DRIVE_REMOTE}/progression/step={step}")
 
     del ddpm
     torch.cuda.empty_cache()
