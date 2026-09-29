@@ -277,12 +277,21 @@ def compute_fid_with_error_analysis(gen_dir, label, k=N_WORST_SAMPLES):
 
 def all_ckpt_steps(label):
     """Lists available step=N.ckpt files directly on Drive -- no download needed just to know
-    which checkpoints exist."""
+    which checkpoints exist. Skips names that don't match the exact pattern (e.g. Drive sync-
+    conflict duplicates like "step=22000_2026-9-29_conflict (1).ckpt", seen in practice from
+    training-time concurrent writes) instead of crashing on them."""
     remote_dir = drive_ckpt_dir(label)
     result = subprocess.run(["rclone", "lsf", remote_dir, "--include", "step=*.ckpt"],
                              capture_output=True, text=True, timeout=60)
     names = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-    return sorted(int(re.search(r"step=(\d+)\.ckpt", n).group(1)) for n in names)
+    steps = set()
+    for n in names:
+        m = re.fullmatch(r"step=(\d+)\.ckpt", n)
+        if m:
+            steps.add(int(m.group(1)))
+        else:
+            print(f"[warn] {label}: ignoring unexpected checkpoint filename '{n}'", flush=True)
+    return sorted(steps)
 
 
 def load_results():
