@@ -159,6 +159,12 @@ def main(args):
                 save_traj_strip(save_dir / f"step={step}-traj.png", traj, num_frames=10, pad=4)
 
                 save_everything()
+                # Permanent, step-stamped snapshot of the model weights -- unlike
+                # last.ckpt (overwritten every log_interval), this one is never
+                # replaced, so any earlier step's model can still be reloaded and
+                # sampled from later. No disk-space gating: rented-pod disks aren't
+                # the constrained local disk this used to be written for.
+                ddpm.save(str(save_dir / f"step={step}.ckpt"))
                 ddpm.train()
 
             img, label = next(train_it)
@@ -184,6 +190,7 @@ def main(args):
     plt.savefig(f"{save_dir}/loss.png")
     plt.close()
     save_everything()
+    ddpm.save(str(save_dir / f"step={step}.ckpt"))
     print(f"Saved the final checkpoint at step {step} to {ckpt_path}")
 
 
