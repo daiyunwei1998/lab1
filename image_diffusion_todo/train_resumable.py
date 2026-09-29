@@ -27,9 +27,22 @@ What this script adds:
 
 Usage: identical CLI to train.py, e.g.
     python train_resumable.py --mode linear --predictor noise --train_num_steps 100000
+
+Real-time Drive sync (optional, off by default):
+  Pass --drive_remote gdrive:lab1-ckpts/<label> to sync results/ to Google Drive
+  right after every checkpoint write (not on a separate timer -- tied directly to
+  the moment new data actually exists, so it's as close to real-time as syncing
+  can be without wastefully re-uploading unchanged data in between).
+  Prints "SYNC OK at step N" after each one, and a distinct
+  "FINAL SYNC COMPLETE -- SAFE TO DELETE INSTANCE" line after the last one, once
+  training has fully finished and that last sync has been confirmed to succeed --
+  that line is the actual signal it's safe to tear the pod down, not just the
+  "Saved the final checkpoint" line (which only means training is done, not that
+  the data has left the pod yet).
 """
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import matplotlib
@@ -46,6 +59,22 @@ from tqdm import tqdm
 from PIL import Image
 
 matplotlib.use("Agg")
+
+
+def sync_to_drive(drive_remote: str, step: int, final: bool = False) -> None:
+    if not drive_remote:
+        return
+    result = subprocess.run(
+        ["rclone", "copy", "results", drive_remote, "--update", "-q"]
+    )
+    if result.returncode != 0:
+        print(f"SYNC FAILED at step {step} (rclone exit {result.returncode}) -- "
+              f"NOT safe to delete the instance yet, retrying next checkpoint.")
+        return
+    if final:
+        print("FINAL SYNC COMPLETE -- SAFE TO DELETE INSTANCE")
+    else:
+        print(f"SYNC OK at step {step}")
 
 
 def main(args):
@@ -165,6 +194,7 @@ def main(args):
                 # sampled from later. No disk-space gating: rented-pod disks aren't
                 # the constrained local disk this used to be written for.
                 ddpm.save(str(save_dir / f"step={step}.ckpt"))
+                sync_to_drive(args.drive_remote, step)
                 ddpm.train()
 
             img, label = next(train_it)
@@ -192,6 +222,7 @@ def main(args):
     save_everything()
     ddpm.save(str(save_dir / f"step={step}.ckpt"))
     print(f"Saved the final checkpoint at step {step} to {ckpt_path}")
+    sync_to_drive(args.drive_remote, step, final=True)
 
 
 if __name__ == "__main__":
@@ -206,6 +237,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--warmup_steps", type=int, default=200)
     parser.add_argument("--log_interval", type=int, default=200)
+    parser.add_argument(
+        "--drive_remote", type=str, default="",
+        help="rclone remote:path (e.g. gdrive:lab1-ckpts/linear_noise) to sync "
+             "results/ to after every checkpoint write. Empty = sync disabled.",
+    )
     parser.add_argument(
         "--max_num_images_per_cat",
         type=int,
