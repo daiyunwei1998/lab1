@@ -158,10 +158,29 @@ def to_x0_hat(label, x_t, t_idx, net_out):
     return x0_hat.clamp(-1, 1)
 
 
+def existing_fid_at_step(label, step):
+    """Checks fid_curve_results.json (already merged with whatever run_analysis.py /
+    analyze_checkpoint.py have recorded) for a value at this exact step -- if that step was
+    each config's genuine `--is_final` checkpoint (500 samples), recomputing it here would
+    just waste GPU time reproducing a number that's already correct and already on Drive."""
+    path = f"{OUT_DIR}/fid_curve_results.json"
+    if not os.path.exists(path):
+        subprocess.run(["rclone", "copyto", f"{DRIVE_REMOTE}/fid_curve_results.json", path],
+                        capture_output=True, timeout=60)
+    if not os.path.exists(path):
+        return None
+    return json.load(open(path)).get(label, {}).get(str(step))
+
+
 def equal_budget_fid(step, n_samples=500):
     print(f"=== Equal-budget FID @ step={step} ===", flush=True)
     results = {}
     for label in CONFIGS:
+        existing = existing_fid_at_step(label, step)
+        if existing is not None:
+            print(f"{label}: reusing existing FID={existing:.4f} at step={step} (already computed)", flush=True)
+            results[label] = existing
+            continue
         ddpm = fetch_and_load(label, step)
         gen_dir = f"/tmp/gen_eqb/{label}"
         generate_samples(ddpm, n_samples, gen_dir)
@@ -242,9 +261,11 @@ def reconstruction_error(step, n_val_images=6):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--step", type=int, default=50000,
-                         help="matched checkpoint step -- the training budget common to "
-                              "quad_noise/cosine_noise/linear_x0/linear_mean's own final checkpoint")
+    parser.add_argument("--step", type=int, default=100000,
+                         help="matched checkpoint step -- quad_noise/cosine_noise/linear_x0/"
+                              "linear_mean's own final checkpoint; linear_noise trained further "
+                              "(to 150000) but its own step=100000 point is also a genuine "
+                              "500-sample final from its original (pre-extension) run")
     parser.add_argument("--n-val-images", type=int, default=6)
     args = parser.parse_args()
 
