@@ -171,14 +171,25 @@ def load_from_path(local_path):
     return ddpm
 
 
-def all_ckpt_steps(label):
+def all_ckpt_steps(label, attempts=3, timeout=60):
     """Lists available step=N.ckpt files directly on Drive -- no download needed just to know
     which checkpoints exist. Skips names that don't match the exact pattern (e.g. Drive sync-
     conflict duplicates like "step=22000_2026-9-29_conflict (1).ckpt", seen in practice from
-    training-time concurrent writes) instead of crashing on them."""
+    training-time concurrent writes) instead of crashing on them. Retries on a hard timeout --
+    same reasoning as fetch_file: under heavy Drive rate-limiting this can hang past its
+    timeout despite rclone having no large payload to move here, just a directory listing."""
     remote_dir = drive_ckpt_dir(label)
-    result = subprocess.run(["rclone", "lsf", remote_dir, "--include", "step=*.ckpt"],
-                             capture_output=True, text=True, timeout=60)
+    result = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(["rclone", "lsf", remote_dir, "--include", "step=*.ckpt"],
+                                     capture_output=True, text=True, timeout=timeout)
+            break
+        except subprocess.TimeoutExpired as e:
+            print(f"[warn] listing {remote_dir} timed out (attempt {attempt}/{attempts}): {e}", flush=True)
+    if result is None:
+        print(f"[warn] {label}: giving up listing checkpoints after {attempts} attempts", flush=True)
+        return []
     names = [l.strip() for l in result.stdout.splitlines() if l.strip()]
     steps = set()
     for n in names:
