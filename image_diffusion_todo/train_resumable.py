@@ -39,15 +39,32 @@ Real-time Drive sync (optional, off by default):
   that line is the actual signal it's safe to tear the pod down, not just the
   "Saved the final checkpoint" line (which only means training is done, not that
   the data has left the pod yet).
+
+Real-time FID (optional, off by default):
+  Pass --analysis_remote gdrive:lab1-analysis (and --fid_interval, default 10000)
+  to compute FID right after each periodic/final checkpoint save, using the model
+  already resident in memory -- no round trip of uploading a checkpoint to Drive
+  and later re-downloading it in a separate analysis pass just to sample from it.
+  Results merge into the SAME fid_curve_results.json / error_analysis_{label}.json
+  / worst_samples/ layout run_analysis.py produces, so analysis.ipynb doesn't care
+  which of the two computed a given number. Since another pod's run_analysis.py
+  may be writing to the same fid_curve_results.json concurrently, updates fetch
+  the current remote copy first and merge into it rather than overwriting --
+  hit a Drive sync conflict earlier this session from two writers doing a naive
+  overwrite, this avoids repeating that.
 """
 import argparse
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
 import torch
+from analysis_lib import (compute_fid, compute_fid_with_error_analysis,
+                          generate_samples)
 from dataset import (AFHQDataModule, get_data_iterator, save_traj_strip,
                      tensor_to_pil_image)
 from dotmap import DotMap
@@ -59,6 +76,65 @@ from tqdm import tqdm
 from PIL import Image
 
 matplotlib.use("Agg")
+
+ANALYSIS_OUT = "analysis_out"
+N_SAMPLES_FINAL = 500
+N_SAMPLES_CURVE = 100
+
+
+def fetch_remote_results(analysis_remote, timeout=60):
+    """Best-effort read of the current remote fid_curve_results.json, so a merge-then-write
+    doesn't clobber another pod's entries for other configs/steps."""
+    if not analysis_remote:
+        return {}
+    tmp = f"{ANALYSIS_OUT}/.remote_fetch_tmp.json"
+    try:
+        r = subprocess.run(
+            ["rclone", "copyto", f"{analysis_remote}/fid_curve_results.json", tmp],
+            capture_output=True, timeout=timeout,
+        )
+        if r.returncode == 0 and os.path.exists(tmp):
+            data = json.load(open(tmp))
+            os.remove(tmp)
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def run_analysis_at_step(ddpm, step, label, analysis_remote, is_final):
+    """Computes one FID curve point (or, at the final checkpoint, the full 500-sample
+    headline FID + error analysis) using ddpm as it currently sits in memory -- the whole
+    point being that this needs no checkpoint download, since training already has it."""
+    was_training = ddpm.training
+    ddpm.eval()
+    try:
+        if is_final:
+            gen_dir = f"{ANALYSIS_OUT}/final_samples/{label}"
+            generate_samples(ddpm, N_SAMPLES_FINAL, gen_dir)
+            fid = compute_fid_with_error_analysis(gen_dir, ANALYSIS_OUT, label)
+        else:
+            gen_dir = f"/tmp/gen_{label}_{step}"
+            generate_samples(ddpm, N_SAMPLES_CURVE, gen_dir)
+            fid = compute_fid(gen_dir)
+            shutil.rmtree(gen_dir, ignore_errors=True)
+    finally:
+        if was_training:
+            ddpm.train()
+
+    os.makedirs(ANALYSIS_OUT, exist_ok=True)
+    results = fetch_remote_results(analysis_remote)
+    results.setdefault(label, {})[str(step)] = fid
+    results_path = f"{ANALYSIS_OUT}/fid_curve_results.json"
+    json.dump(results, open(results_path, "w"), indent=2)
+    print(f"[analysis] {label} step={step} FID={fid:.4f}", flush=True)
+
+    if analysis_remote:
+        subprocess.Popen(
+            ["rclone", "copy", ANALYSIS_OUT, analysis_remote, "--update", "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    return fid
 
 
 def sync_to_drive(drive_remote: str, step: int, final: bool = False) -> None:
@@ -155,6 +231,10 @@ def main(args):
         optimizer, lr_lambda=lambda t: min((t + 1) / config.warmup_steps, 1.0)
     )
 
+    # NOT named `label` -- the training loop below reuses that name for the
+    # per-batch AFHQ class-label tensor from next(train_it), which would shadow it.
+    config_label = f"{config.mode}_{config.predictor}"
+
     ckpt_path = save_dir / "last.ckpt"
     state_path = save_dir / "train_state.pt"
 
@@ -212,6 +292,10 @@ def main(args):
                 # the constrained local disk this used to be written for.
                 ddpm.save(str(save_dir / f"step={step}.ckpt"))
                 sync_to_drive(args.drive_remote, step)
+
+                if args.analysis_remote and step > 0 and step % args.fid_interval == 0:
+                    run_analysis_at_step(ddpm, step, config_label, args.analysis_remote, is_final=False)
+
                 ddpm.train()
 
             img, label = next(train_it)
@@ -239,6 +323,10 @@ def main(args):
     save_everything()
     ddpm.save(str(save_dir / f"step={step}.ckpt"))
     print(f"Saved the final checkpoint at step {step} to {ckpt_path}")
+
+    if args.analysis_remote:
+        run_analysis_at_step(ddpm, step, config_label, args.analysis_remote, is_final=True)
+
     sync_to_drive(args.drive_remote, step, final=True)
 
 
@@ -258,6 +346,18 @@ if __name__ == "__main__":
         "--drive_remote", type=str, default="",
         help="rclone remote:path (e.g. gdrive:lab1-ckpts/linear_noise) to sync "
              "results/ to after every checkpoint write. Empty = sync disabled.",
+    )
+    parser.add_argument(
+        "--analysis_remote", type=str, default="",
+        help="rclone remote:path (e.g. gdrive:lab1-analysis) to compute and sync FID to "
+             "right after each periodic/final checkpoint, using the model already in "
+             "memory -- no separate analysis pass needed. Empty = disabled.",
+    )
+    parser.add_argument(
+        "--fid_interval", type=int, default=10000,
+        help="compute a FID curve point every N steps when --analysis_remote is set "
+             "(independent of --log_interval, since FID is far more expensive than the "
+             "loss-plot/sample-preview saves log_interval triggers).",
     )
     parser.add_argument(
         "--max_num_images_per_cat",

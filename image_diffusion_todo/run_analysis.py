@@ -79,17 +79,11 @@ import os
 import re
 import shutil
 import subprocess
-import sys
-from pathlib import Path
 
-import numpy as np
 import torch
 
-from dataset import tensor_to_pil_image
+from analysis_lib import compute_fid, compute_fid_with_error_analysis, generate_samples
 from model import DiffusionModule
-
-sys.path.insert(0, str(Path(__file__).parent / "fid"))
-from measure_fid import InceptionV3, get_eval_loader  # noqa: E402 -- teacher's file, reused not edited
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -111,8 +105,6 @@ PREDICTOR_LABELS = ["linear_noise", "linear_x0", "linear_mean"]  # for the predi
 N_SAMPLES_FINAL = 500   # project's own FID convention (README default) -- for the headline table
 N_SAMPLES_CURVE = 100   # cheaper: the curve only needs to show the trend
 N_CURVE_POINTS = 8      # evenly-spaced checkpoints per config, not every saved step
-N_WORST_SAMPLES = 16    # per config, for the final-checkpoint error-analysis figure
-EVAL_DIR = "data/afhq/eval"
 
 
 def drive_ckpt_dir(label):
@@ -177,113 +169,6 @@ def load_from_path(local_path):
     ddpm.load_state_dict(dic["state_dict"])
     ddpm.eval()
     return ddpm
-
-
-def generate_samples(ddpm, n, out_dir, batch_size=64):
-    os.makedirs(out_dir, exist_ok=True)
-    idx, remaining = 0, n
-    with torch.no_grad():
-        while remaining > 0:
-            b = min(batch_size, remaining)
-            samples = ddpm.sample(b)
-            for im in tensor_to_pil_image(samples):
-                im.save(f"{out_dir}/{idx}.png")
-                idx += 1
-            remaining -= b
-    return out_dir
-
-
-def _sqrt_psd(a):
-    """Matrix square root of a symmetric PSD matrix via eigendecomposition -- unlike
-    scipy.linalg.sqrtm's Schur-based algorithm, this can't return a wrong-but-finite
-    result for a near-singular input; eigenvalues are just clamped at 0."""
-    w, v = np.linalg.eigh(a)
-    w = np.clip(w, 0, None)
-    return (v * np.sqrt(w)) @ v.T
-
-
-def frechet_distance_stable(mu1, cov1, mu2, cov2, eps=1e-6):
-    """Frechet distance without scipy.linalg.sqrtm on the asymmetric cov1 @ cov2 product --
-    see the module docstring for why that's fragile here. Reformulates the cross term as
-    Tr(sqrt(C1^0.5 @ C2 @ C1^0.5)), which is symmetric PSD and safe to take via eigh."""
-    diff = mu1 - mu2
-    d = cov1.shape[0]
-    c1 = cov1 + eps * np.eye(d)
-    c2 = cov2 + eps * np.eye(d)
-    c1_sqrt = _sqrt_psd(c1)
-    inner_sqrt = _sqrt_psd(c1_sqrt @ c2 @ c1_sqrt)
-    return float(diff.dot(diff) + np.trace(cov1) + np.trace(cov2) - 2 * np.trace(inner_sqrt))
-
-
-_inception = None
-_real_stats = None  # (mu, cov, activations) for the eval set -- same across every config, computed once
-
-
-def get_inception():
-    global _inception
-    if _inception is None:
-        _inception = InceptionV3(for_train=False)
-        ckpt = torch.load(Path(__file__).parent / "fid" / "afhq_inception_v3.ckpt", map_location="cpu")
-        _inception.load_state_dict(ckpt)
-        _inception = _inception.eval().to(device)
-    return _inception
-
-
-def embed_dir(image_dir, img_size=256, batch_size=64):
-    inception = get_inception()
-    loader = get_eval_loader(image_dir, img_size, batch_size)
-    actvs = []
-    with torch.no_grad():
-        for x in loader:
-            actvs.append(inception(x.to(device)))
-    return torch.cat(actvs, dim=0).cpu().numpy()
-
-
-def get_real_stats(eval_dir=EVAL_DIR):
-    global _real_stats
-    if _real_stats is None:
-        actvs = embed_dir(eval_dir)
-        _real_stats = (np.mean(actvs, axis=0), np.cov(actvs, rowvar=False), actvs)
-    return _real_stats
-
-
-def compute_fid(gen_dir):
-    real_mu, real_cov, _ = get_real_stats()
-    gen_actvs = embed_dir(gen_dir)
-    return frechet_distance_stable(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
-
-
-def compute_fid_with_error_analysis(gen_dir, label, k=N_WORST_SAMPLES):
-    """Like compute_fid, but keeps the generated images and ranks each one by its nearest-neighbor
-    distance to the real Inception activation cloud -- a per-image proxy for "how unrealistic is
-    this sample", since FID itself is a distributional statistic and isn't defined per image.
-    Used only for each config's final checkpoint, where seeing the worst offenders matters."""
-    real_mu, real_cov, real_actvs = get_real_stats()
-    files = sorted(Path(gen_dir).glob("*.png"), key=lambda p: int(p.stem))
-    gen_actvs = embed_dir(gen_dir)
-
-    fid = frechet_distance_stable(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
-
-    real_t = torch.from_numpy(real_actvs).to(device)
-    gen_t = torch.from_numpy(gen_actvs).to(device)
-    nn_dist = torch.cdist(gen_t, real_t).min(dim=1).values.cpu().numpy()
-
-    ranked = sorted(zip(files, nn_dist), key=lambda p: -p[1])
-    worst = ranked[:k]
-    worst_dir = f"{OUT_DIR}/worst_samples/{label}"
-    os.makedirs(worst_dir, exist_ok=True)
-    for f, _ in worst:
-        shutil.copy(f, f"{worst_dir}/{f.name}")
-
-    json.dump(
-        {
-            "fid": float(fid),
-            "worst": [{"file": f.name, "nn_distance": float(d)} for f, d in worst],
-            "per_image_nn_distance": {f.name: float(d) for f, d in zip(files, nn_dist)},
-        },
-        open(f"{OUT_DIR}/error_analysis_{label}.json", "w"), indent=2,
-    )
-    return float(fid)
 
 
 def all_ckpt_steps(label):
@@ -375,7 +260,7 @@ def process_checkpoint(ddpm, label, step, is_final, need_fid, need_predictor_sam
             # needed for the per-image error analysis, not just the scalar FID
             gen_dir = f"{OUT_DIR}/final_samples/{label}"
             generate_samples(ddpm, N_SAMPLES_FINAL, gen_dir)
-            fid = compute_fid_with_error_analysis(gen_dir, label)
+            fid = compute_fid_with_error_analysis(gen_dir, OUT_DIR, label)
         else:
             gen_dir = f"/tmp/gen/{label}_{step}"
             generate_samples(ddpm, N_SAMPLES_CURVE, gen_dir)
