@@ -46,10 +46,18 @@ def main(args):
     print(f"[analysis] {args.label} step={args.step} FID={fid:.4f}", flush=True)
 
     if args.analysis_remote:
-        subprocess.run(
-            ["rclone", "copy", args.out_dir, args.analysis_remote, "--update", "-q"],
-            timeout=90,
-        )
+        # A Drive rate-limit stall here must not crash this process -- the FID value is
+        # already safely recorded on local disk above (merge_fid_result), so a failed sync
+        # just means this checkpoint's images/error-analysis reach Drive on a later sync
+        # (e.g. the next checkpoint's, or a manual retry) instead of right now.
+        try:
+            subprocess.run(
+                ["rclone", "copy", args.out_dir, args.analysis_remote, "--update", "-q"],
+                timeout=90,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[analysis] rclone sync timed out after 90s for step={args.step}, "
+                  f"continuing (data is safe on local disk)", flush=True)
 
 
 if __name__ == "__main__":
