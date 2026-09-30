@@ -69,17 +69,23 @@ def drive_ckpt_dir(label):
 
 
 def fetch_and_load(label, step):
+    """Tries step={step}.ckpt first; falls back to last.ckpt if that exact file isn't on
+    Drive yet -- hit this directly for linear_mean, whose training log confirmed step=100000
+    as the final step but whose numbered checkpoint file hadn't finished syncing (last.ckpt,
+    which train_resumable.py always keeps current, had)."""
     os.makedirs(LOCAL_CACHE, exist_ok=True)
-    filename = f"step={step}.ckpt"
-    local_path = f"{LOCAL_CACHE}/{filename}"
-    result = subprocess.run(
-        ["rclone", "copyto", f"{drive_ckpt_dir(label)}/{filename}", local_path,
-         "--retries", "5", "--low-level-retries", "10"],
-        capture_output=True, text=True, timeout=300,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to fetch {label} step={step}:\n{result.stderr}")
-    return load_checkpoint(local_path, delete_after=True)
+    for filename in (f"step={step}.ckpt", "last.ckpt"):
+        local_path = f"{LOCAL_CACHE}/{filename}"
+        result = subprocess.run(
+            ["rclone", "copyto", f"{drive_ckpt_dir(label)}/{filename}", local_path,
+             "--retries", "5", "--low-level-retries", "10"],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            if filename == "last.ckpt":
+                print(f"[warn] {label}: step={step}.ckpt not found on Drive, used last.ckpt instead", flush=True)
+            return load_checkpoint(local_path, delete_after=True)
+    raise RuntimeError(f"Failed to fetch {label} step={step} (also tried last.ckpt):\n{result.stderr}")
 
 
 def rclone_sync(local, remote, timeout=120):
@@ -201,14 +207,17 @@ def equal_budget_fid(step, n_samples=500):
 def same_seed_grid(step, n_samples=8):
     print(f"=== Same-seed sample grid @ step={step} ===", flush=True)
     for label in PREDICTOR_LABELS:
-        predictor = CONFIGS[label]["predictor"]
-        ddpm = fetch_and_load(label, step)
-        torch.manual_seed(SAME_SEED_VALUE)  # same x_T + same per-step z draws across all 3 models
-        target = f"{OUT_DIR}/same_seed_samples/{predictor}"
-        generate_samples(ddpm, n_samples, target, batch_size=n_samples)
-        print(f"{label} -> {target}", flush=True)
-        del ddpm
-        torch.cuda.empty_cache()
+        try:
+            predictor = CONFIGS[label]["predictor"]
+            ddpm = fetch_and_load(label, step)
+            torch.manual_seed(SAME_SEED_VALUE)  # same x_T + same per-step z draws across all 3 models
+            target = f"{OUT_DIR}/same_seed_samples/{predictor}"
+            generate_samples(ddpm, n_samples, target, batch_size=n_samples)
+            print(f"{label} -> {target}", flush=True)
+            del ddpm
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[warn] same_seed_grid failed for {label}, skipping: {e}", flush=True)
     rclone_sync(f"{OUT_DIR}/same_seed_samples", f"{DRIVE_REMOTE}/same_seed_samples")
 
 
@@ -220,32 +229,35 @@ def reconstruction_error(step, n_val_images=6):
     results = {}  # {predictor: {t_frac: mse}}
     for label in PREDICTOR_LABELS:
         predictor = CONFIGS[label]["predictor"]
-        ddpm = fetch_and_load(label, step)
-        alpha_bar = alpha_bar_for(label).to(device)
-        results[predictor] = {}
+        try:
+            ddpm = fetch_and_load(label, step)
+            alpha_bar = alpha_bar_for(label).to(device)
+            results[predictor] = {}
 
-        for frac in T_FRACTIONS:
-            t_idx = int(frac * (NUM_TRAIN_TIMESTEPS - 1))
-            t_tensor = torch.full((x0_batch.shape[0],), t_idx, device=device, dtype=torch.long)
-            eps = torch.randn_like(x0_batch)
-            ab_t = alpha_bar[t_idx]
-            x_t = ab_t.sqrt() * x0_batch + (1 - ab_t).sqrt() * eps
+            for frac in T_FRACTIONS:
+                t_idx = int(frac * (NUM_TRAIN_TIMESTEPS - 1))
+                t_tensor = torch.full((x0_batch.shape[0],), t_idx, device=device, dtype=torch.long)
+                eps = torch.randn_like(x0_batch)
+                ab_t = alpha_bar[t_idx]
+                x_t = ab_t.sqrt() * x0_batch + (1 - ab_t).sqrt() * eps
 
-            with torch.no_grad():
-                net_out = ddpm.network(x_t, timestep=t_tensor)
-            x0_hat = to_x0_hat(label, x_t, t_idx, net_out)
+                with torch.no_grad():
+                    net_out = ddpm.network(x_t, timestep=t_tensor)
+                x0_hat = to_x0_hat(label, x_t, t_idx, net_out)
 
-            mse = ((x0_hat - x0_batch) ** 2).mean().item()
-            results[predictor][frac] = mse
-            print(f"{label}  t/T={frac}  MSE(x0_hat, x0)={mse:.4f}", flush=True)
+                mse = ((x0_hat - x0_batch) ** 2).mean().item()
+                results[predictor][frac] = mse
+                print(f"{label}  t/T={frac}  MSE(x0_hat, x0)={mse:.4f}", flush=True)
 
-            recon_dir = f"{OUT_DIR}/reconstruction/{predictor}/t={frac}"
-            os.makedirs(recon_dir, exist_ok=True)
-            for i, im in enumerate(tensor_to_pil_image(x0_hat)):
-                im.save(f"{recon_dir}/{i}.png")
+                recon_dir = f"{OUT_DIR}/reconstruction/{predictor}/t={frac}"
+                os.makedirs(recon_dir, exist_ok=True)
+                for i, im in enumerate(tensor_to_pil_image(x0_hat)):
+                    im.save(f"{recon_dir}/{i}.png")
 
-        del ddpm
-        torch.cuda.empty_cache()
+            del ddpm
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[warn] reconstruction_error failed for {label}, skipping: {e}", flush=True)
 
     # also save the real x0 and the noisy x_t at each t for side-by-side comparison in the report
     real_dir = f"{OUT_DIR}/reconstruction/real_x0"
