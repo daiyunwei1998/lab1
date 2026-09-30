@@ -120,18 +120,29 @@ def drive_ckpt_dir(label):
     return f"{DRIVE_CKPT_ROOT}/{label}/predictor_{cfg['predictor']}/beta_{cfg['mode']}"
 
 
-def fetch_file(remote_dir, filename):
-    """Download exactly one file from Drive to the local cache, returning its local path."""
+def fetch_file(remote_dir, filename, attempts=3, timeout=300):
+    """Download exactly one file from Drive to the local cache, returning its local path.
+    Retries whole attempts (not just rclone's internal --retries) on a hard timeout -- hit
+    this directly under heavy Drive rate-limiting, where a single rclone invocation can hang
+    past even a 300s timeout despite its own retry flags."""
     os.makedirs(LOCAL_CACHE, exist_ok=True)
     local_path = f"{LOCAL_CACHE}/{filename}"
-    result = subprocess.run(
-        ["rclone", "copyto", f"{remote_dir}/{filename}", local_path,
-         "--retries", "5", "--low-level-retries", "10"],
-        capture_output=True, text=True, timeout=300,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to fetch {remote_dir}/{filename}:\n{result.stderr}")
-    return local_path
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["rclone", "copyto", f"{remote_dir}/{filename}", local_path,
+                 "--retries", "5", "--low-level-retries", "10"],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode == 0:
+                return local_path
+            last_err = RuntimeError(f"Failed to fetch {remote_dir}/{filename}:\n{result.stderr}")
+        except subprocess.TimeoutExpired as e:
+            last_err = e
+        print(f"[warn] fetch {remote_dir}/{filename} failed (attempt {attempt}/{attempts}): {last_err}",
+              flush=True)
+    raise last_err
 
 
 _prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -422,10 +433,6 @@ def main():
             print(f"[skip] {label} step={step} (nothing new needed)")
             continue
 
-        remote_dir = drive_ckpt_dir(label)
-        filename = f"step={step}.ckpt"
-        local_path = get_checkpoint_path(remote_dir, filename)  # blocks only if not prefetched
-
         # kick off the next NEEDED checkpoint's download now, so it overlaps with this one's GPU work
         for nxt in tasks[i + 1:]:
             nxt_fid, nxt_pred, nxt_prog = needs_processing(
@@ -434,12 +441,21 @@ def main():
                 prefetch(drive_ckpt_dir(nxt["label"]), f"step={nxt['step']}.ckpt")
                 break
 
-        print(f"[load] {label} step={step} (fid={need_fid} predictor_samples={need_pred} progression={need_prog})",
-              flush=True)
-        ddpm = load_from_path(local_path)
-        process_checkpoint(ddpm, label, step, is_final, need_fid, need_pred, need_prog, results)
-        del ddpm
-        torch.cuda.empty_cache()
+        # one checkpoint's persistent failure (e.g. Drive rate-limiting a download past all
+        # retries) shouldn't take down the other ~40 checkpoints still queued behind it
+        try:
+            remote_dir = drive_ckpt_dir(label)
+            filename = f"step={step}.ckpt"
+            local_path = get_checkpoint_path(remote_dir, filename)  # blocks only if not prefetched
+
+            print(f"[load] {label} step={step} "
+                  f"(fid={need_fid} predictor_samples={need_pred} progression={need_prog})", flush=True)
+            ddpm = load_from_path(local_path)
+            process_checkpoint(ddpm, label, step, is_final, need_fid, need_pred, need_prog, results)
+            del ddpm
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[warn] {label} step={step} failed, skipping: {e}", flush=True)
 
     print("ALL DONE")
 
