@@ -83,10 +83,7 @@ import subprocess
 import torch
 
 from analysis_lib import (compute_fid, compute_fid_with_error_analysis,
-                          generate_samples, merge_fid_result)
-from model import DiffusionModule
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
+                          generate_samples, load_checkpoint, merge_fid_result)
 
 DRIVE_CKPT_ROOT = "gdrive:lab1-ckpts"   # remote -- listed/fetched on demand, never bulk-copied
 LOCAL_CACHE = "/tmp/ckpt_cache"         # holds exactly one checkpoint file at a time
@@ -159,17 +156,7 @@ def get_checkpoint_path(remote_dir, filename):
 
 
 def load_from_path(local_path):
-    try:
-        dic = torch.load(local_path, map_location=device, weights_only=False)
-    finally:
-        os.remove(local_path)  # done with the file on disk the instant it's loaded into memory
-    network = dic["hparams"]["network"].to(device)
-    var_scheduler = dic["hparams"]["var_scheduler"].to(device)
-    predictor = dic["hparams"].get("predictor", "noise")
-    ddpm = DiffusionModule(network, var_scheduler, predictor=predictor).to(device)
-    ddpm.load_state_dict(dic["state_dict"])
-    ddpm.eval()
-    return ddpm
+    return load_checkpoint(local_path, delete_after=True)
 
 
 def all_ckpt_steps(label, attempts=3, timeout=60):

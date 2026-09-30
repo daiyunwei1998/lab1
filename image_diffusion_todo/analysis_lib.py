@@ -1,7 +1,9 @@
-"""Shared FID computation, used by both run_analysis.py (post-hoc analysis of already-
-trained checkpoints downloaded from Drive) and train_resumable.py (computing FID right
-after each checkpoint save, using the model already resident in memory -- no round trip
-of upload-then-later-redownload through Drive needed).
+"""Shared FID computation, used by run_analysis.py (post-hoc analysis of already-trained
+checkpoints downloaded from Drive), analyze_checkpoint.py (a standalone per-checkpoint
+analysis run, launched as a background subprocess by train_resumable.py right after each
+checkpoint save so training isn't blocked waiting on it -- no round trip of uploading a
+checkpoint to Drive and later re-downloading it in a separate pass just to sample from it),
+and train_resumable.py itself (only for merge_fid_result, to record results the same way).
 
 Frechet distance uses symmetric eigendecomposition, not scipy.linalg.sqrtm on the teacher's
 fid/measure_fid.py frechet_distance() (that file itself is untouched -- InceptionV3 and its
@@ -23,12 +25,14 @@ import numpy as np
 import torch
 
 from dataset import tensor_to_pil_image
+from model import DiffusionModule
 
 sys.path.insert(0, str(Path(__file__).parent / "fid"))
 from measure_fid import InceptionV3, get_eval_loader  # noqa: E402 -- teacher's file, reused not edited
 
 EVAL_DIR = "data/afhq/eval"
 N_WORST_SAMPLES = 16
+ANALYSIS_OUT_DEFAULT = "analysis_out"
 
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 _inception = None
@@ -83,6 +87,24 @@ def frechet_distance_stable(mu1, cov1, mu2, cov2, eps=1e-6):
     c1_sqrt = _sqrt_psd(c1)
     inner_sqrt = _sqrt_psd(c1_sqrt @ c2 @ c1_sqrt)
     return float(diff.dot(diff) + np.trace(cov1) + np.trace(cov2) - 2 * np.trace(inner_sqrt))
+
+
+def load_checkpoint(local_path, delete_after=False):
+    """Loads a checkpoint file into a DiffusionModule. delete_after=True for a checkpoint
+    downloaded into a scratch cache (run_analysis.py); False for one of train_resumable.py's
+    permanent step={N}.ckpt files, which are kept forever by design."""
+    try:
+        dic = torch.load(local_path, map_location=_device, weights_only=False)
+    finally:
+        if delete_after:
+            os.remove(local_path)
+    network = dic["hparams"]["network"].to(_device)
+    var_scheduler = dic["hparams"]["var_scheduler"].to(_device)
+    predictor = dic["hparams"].get("predictor", "noise")
+    ddpm = DiffusionModule(network, var_scheduler, predictor=predictor).to(_device)
+    ddpm.load_state_dict(dic["state_dict"])
+    ddpm.eval()
+    return ddpm
 
 
 def generate_samples(ddpm, n, out_dir, batch_size=64):

@@ -42,29 +42,40 @@ Real-time Drive sync (optional, off by default):
 
 Real-time FID (optional, off by default):
   Pass --analysis_remote gdrive:lab1-analysis (and --fid_interval, default 10000)
-  to compute FID right after each periodic/final checkpoint save, using the model
-  already resident in memory -- no round trip of uploading a checkpoint to Drive
-  and later re-downloading it in a separate analysis pass just to sample from it.
+  to launch analyze_checkpoint.py as a background subprocess right after each
+  periodic/final checkpoint save, reading the checkpoint file that was just
+  written to local disk -- no round trip of uploading it to Drive and later
+  re-downloading it in a separate analysis pass just to sample from it.
+  Deliberately a SEPARATE PROCESS, not computed in-process against the live model:
+  a 100/500-sample FID computation takes several minutes, and blocking the
+  training loop for that long every time is wasted wall-clock (an earlier version
+  of this script did exactly that). Running it as its own process means training
+  keeps taking gradient steps while analysis runs concurrently on the same GPU
+  (there's ample VRAM headroom -- a training step and a sampling pass each use a
+  few GB). To keep this bounded rather than spawning unboundedly many overlapping
+  analysis jobs if one runs long (e.g. a slow Drive sync inside it), at most one
+  is ever in flight: launching the next one first waits for the previous one to
+  finish. A slow analysis/sync only delays when the *next* one starts -- it never
+  blocks or corrupts the training loop's own gradient steps or checkpoint writes.
+
   Results merge into the SAME fid_curve_results.json / error_analysis_{label}.json
   / worst_samples/ layout run_analysis.py produces, so analysis.ipynb doesn't care
-  which of the two computed a given number. Since another pod's run_analysis.py
-  may be writing to the same fid_curve_results.json concurrently, updates fetch
-  the current remote copy first and merge into it rather than overwriting --
-  hit a Drive sync conflict earlier this session from two writers doing a naive
-  overwrite, this avoids repeating that.
+  which one computed a given number. Since another pod's run_analysis.py may be
+  writing to the same fid_curve_results.json concurrently, merge_fid_result unions
+  the local and remote copies rather than letting either overwrite the other --
+  hit real data loss from a naive overwrite earlier this session (two writers,
+  one's sync had failed, the other's fetch-and-overwrite silently dropped it).
 """
 import argparse
 import json
-import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
 import torch
-from analysis_lib import (compute_fid, compute_fid_with_error_analysis,
-                          generate_samples, merge_fid_result)
+from analysis_lib import ANALYSIS_OUT_DEFAULT
 from dataset import (AFHQDataModule, get_data_iterator, save_traj_strip,
                      tensor_to_pil_image)
 from dotmap import DotMap
@@ -77,40 +88,28 @@ from PIL import Image
 
 matplotlib.use("Agg")
 
-ANALYSIS_OUT = "analysis_out"
-N_SAMPLES_FINAL = 500
-N_SAMPLES_CURVE = 100
+ANALYSIS_OUT = ANALYSIS_OUT_DEFAULT
 
 
-def run_analysis_at_step(ddpm, step, label, analysis_remote, is_final):
-    """Computes one FID curve point (or, at the final checkpoint, the full 500-sample
-    headline FID + error analysis) using ddpm as it currently sits in memory -- the whole
-    point being that this needs no checkpoint download, since training already has it."""
-    was_training = ddpm.training
-    ddpm.eval()
-    try:
-        if is_final:
-            gen_dir = f"{ANALYSIS_OUT}/final_samples/{label}"
-            generate_samples(ddpm, N_SAMPLES_FINAL, gen_dir)
-            fid = compute_fid_with_error_analysis(gen_dir, ANALYSIS_OUT, label)
-        else:
-            gen_dir = f"/tmp/gen_{label}_{step}"
-            generate_samples(ddpm, N_SAMPLES_CURVE, gen_dir)
-            fid = compute_fid(gen_dir)
-            shutil.rmtree(gen_dir, ignore_errors=True)
-    finally:
-        if was_training:
-            ddpm.train()
+def launch_analysis(ckpt_path, step, label, analysis_remote, is_final, pending_proc):
+    """Waits for any previously-launched analysis subprocess to finish (bounding
+    concurrency to at most one in flight), then launches a new one in the background for
+    ckpt_path. Returns the new Popen handle -- the caller is expected to thread it through
+    to the next call as `pending_proc` so it stays bounded."""
+    if pending_proc is not None and pending_proc.poll() is None:
+        print(f"[analysis] waiting for the previous analysis job to finish before "
+              f"launching step={step}...", flush=True)
+        pending_proc.wait()
 
-    merge_fid_result(ANALYSIS_OUT, analysis_remote, label, step, fid)
-    print(f"[analysis] {label} step={step} FID={fid:.4f}", flush=True)
-
+    cmd = [sys.executable, "analyze_checkpoint.py",
+           "--ckpt_path", str(ckpt_path), "--label", label, "--step", str(step),
+           "--out_dir", ANALYSIS_OUT]
+    if is_final:
+        cmd.append("--is_final")
     if analysis_remote:
-        subprocess.Popen(
-            ["rclone", "copy", ANALYSIS_OUT, analysis_remote, "--update", "-q"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    return fid
+        cmd += ["--analysis_remote", analysis_remote]
+    print(f"[analysis] launched step={step} in background", flush=True)
+    return subprocess.Popen(cmd)
 
 
 def sync_to_drive(drive_remote: str, step: int, final: bool = False) -> None:
@@ -243,6 +242,8 @@ def main(args):
             "losses": losses,
         }, state_path)
 
+    pending_analysis = None  # Popen handle for the most recently launched analyze_checkpoint.py
+
     with tqdm(initial=step, total=config.train_num_steps) as pbar:
         while step < config.train_num_steps:
             if step % config.log_interval == 0:
@@ -266,11 +267,14 @@ def main(args):
                 # replaced, so any earlier step's model can still be reloaded and
                 # sampled from later. No disk-space gating: rented-pod disks aren't
                 # the constrained local disk this used to be written for.
-                ddpm.save(str(save_dir / f"step={step}.ckpt"))
+                step_ckpt_path = save_dir / f"step={step}.ckpt"
+                ddpm.save(str(step_ckpt_path))
                 sync_to_drive(args.drive_remote, step)
 
                 if args.analysis_remote and step > 0 and step % args.fid_interval == 0:
-                    run_analysis_at_step(ddpm, step, config_label, args.analysis_remote, is_final=False)
+                    pending_analysis = launch_analysis(
+                        step_ckpt_path, step, config_label, args.analysis_remote,
+                        is_final=False, pending_proc=pending_analysis)
 
                 ddpm.train()
 
@@ -297,11 +301,18 @@ def main(args):
     plt.savefig(f"{save_dir}/loss.png")
     plt.close()
     save_everything()
-    ddpm.save(str(save_dir / f"step={step}.ckpt"))
+    final_ckpt_path = save_dir / f"step={step}.ckpt"
+    ddpm.save(str(final_ckpt_path))
     print(f"Saved the final checkpoint at step {step} to {ckpt_path}")
 
     if args.analysis_remote:
-        run_analysis_at_step(ddpm, step, config_label, args.analysis_remote, is_final=True)
+        # No more training to overlap with, so wait for this one synchronously --
+        # otherwise the script could exit (and the pod get torn down) before the
+        # headline FID actually finishes computing.
+        final_analysis = launch_analysis(
+            final_ckpt_path, step, config_label, args.analysis_remote,
+            is_final=True, pending_proc=pending_analysis)
+        final_analysis.wait()
 
     sync_to_drive(args.drive_remote, step, final=True)
 
