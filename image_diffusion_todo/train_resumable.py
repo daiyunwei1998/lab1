@@ -64,7 +64,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import torch
 from analysis_lib import (compute_fid, compute_fid_with_error_analysis,
-                          generate_samples)
+                          generate_samples, merge_fid_result)
 from dataset import (AFHQDataModule, get_data_iterator, save_traj_strip,
                      tensor_to_pil_image)
 from dotmap import DotMap
@@ -80,26 +80,6 @@ matplotlib.use("Agg")
 ANALYSIS_OUT = "analysis_out"
 N_SAMPLES_FINAL = 500
 N_SAMPLES_CURVE = 100
-
-
-def fetch_remote_results(analysis_remote, timeout=60):
-    """Best-effort read of the current remote fid_curve_results.json, so a merge-then-write
-    doesn't clobber another pod's entries for other configs/steps."""
-    if not analysis_remote:
-        return {}
-    tmp = f"{ANALYSIS_OUT}/.remote_fetch_tmp.json"
-    try:
-        r = subprocess.run(
-            ["rclone", "copyto", f"{analysis_remote}/fid_curve_results.json", tmp],
-            capture_output=True, timeout=timeout,
-        )
-        if r.returncode == 0 and os.path.exists(tmp):
-            data = json.load(open(tmp))
-            os.remove(tmp)
-            return data
-    except Exception:
-        pass
-    return {}
 
 
 def run_analysis_at_step(ddpm, step, label, analysis_remote, is_final):
@@ -122,11 +102,7 @@ def run_analysis_at_step(ddpm, step, label, analysis_remote, is_final):
         if was_training:
             ddpm.train()
 
-    os.makedirs(ANALYSIS_OUT, exist_ok=True)
-    results = fetch_remote_results(analysis_remote)
-    results.setdefault(label, {})[str(step)] = fid
-    results_path = f"{ANALYSIS_OUT}/fid_curve_results.json"
-    json.dump(results, open(results_path, "w"), indent=2)
+    merge_fid_result(ANALYSIS_OUT, analysis_remote, label, step, fid)
     print(f"[analysis] {label} step={step} FID={fid:.4f}", flush=True)
 
     if analysis_remote:

@@ -82,7 +82,8 @@ import subprocess
 
 import torch
 
-from analysis_lib import compute_fid, compute_fid_with_error_analysis, generate_samples
+from analysis_lib import (compute_fid, compute_fid_with_error_analysis,
+                          generate_samples, merge_fid_result)
 from model import DiffusionModule
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -209,19 +210,13 @@ def load_results():
 
 def rclone_sync(local, remote, timeout=90):
     """A blocking rclone copy with a hard timeout -- without one, a Drive rate-limit stall
-    blocks the whole script indefinitely (hit this directly: save_and_sync's copy hung for
-    26+ minutes with 0% GPU util before being killed manually). A timed-out sync isn't fatal:
-    results are already on local disk, and the next sync call retries them."""
+    blocks the whole script indefinitely (hit this directly: a sync hung for 26+ minutes
+    with 0% GPU util before being killed manually). A timed-out sync isn't fatal: results
+    are already on local disk, and the next sync call retries them."""
     try:
         subprocess.run(["rclone", "copy", local, remote, "--update", "-q"], timeout=timeout)
     except subprocess.TimeoutExpired:
         print(f"[warn] rclone sync {local} -> {remote} timed out after {timeout}s, continuing", flush=True)
-
-
-def save_and_sync(results):
-    os.makedirs(OUT_DIR, exist_ok=True)
-    json.dump(results, open(RESULTS_JSON, "w"), indent=2)
-    rclone_sync(OUT_DIR, DRIVE_REMOTE)
 
 
 def evenly_spaced(steps_avail, n):
@@ -279,7 +274,11 @@ def process_checkpoint(ddpm, label, step, is_final, need_fid, need_predictor_sam
             shutil.rmtree(gen_dir, ignore_errors=True)
         results[label][str(step)] = fid
         print(f"[done] {label} step={step} FID={fid:.4f}", flush=True)
-        save_and_sync(results)  # incremental: survives a mid-run crash
+        # merge-safe: another pod (e.g. train_resumable.py's --analysis_remote) may be
+        # writing the same fid_curve_results.json concurrently -- a naive local-write-then-
+        # push would silently clobber whatever it added that this process doesn't know
+        # about (hit this directly: a confirmed final FID vanished this way once already).
+        merge_fid_result(OUT_DIR, DRIVE_REMOTE, label, step, fid)
 
     if need_predictor_samples:
         target = f"{OUT_DIR}/predictor_samples/{CONFIGS[label]['predictor']}"

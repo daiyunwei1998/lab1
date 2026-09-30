@@ -105,6 +105,41 @@ def compute_fid(gen_dir):
     return frechet_distance_stable(real_mu, real_cov, np.mean(gen_actvs, axis=0), np.cov(gen_actvs, rowvar=False))
 
 
+def merge_fid_result(out_dir, remote, label, step, fid, timeout=60):
+    """Records one (label, step) -> fid entry into fid_curve_results.json, safely under
+    concurrent writers (multiple pods can be computing different configs' FIDs at once).
+
+    Never trust a single source as authoritative -- union the on-disk local copy (this
+    process's own prior writes, which may not have reached the remote yet) with whatever
+    the remote currently has (other writers' entries), THEN add the new entry, THEN push.
+    A naive "fetch remote, merge, overwrite local" is NOT safe: if this process's own
+    earlier write never made it to the remote (e.g. a transient Drive rate-limit error),
+    the next fetch-and-overwrite silently drops it -- hit this directly, a confirmed final
+    FID vanished from both copies this way when a second config's analysis ran right after
+    the first config's sync had failed."""
+    local_path = f"{out_dir}/fid_curve_results.json"
+    merged = {}
+    if os.path.exists(local_path):
+        for k_, v_ in json.load(open(local_path)).items():
+            merged.setdefault(k_, {}).update(v_)
+    if remote:
+        tmp = f"{out_dir}/.remote_fetch_tmp.json"
+        try:
+            import subprocess
+            r = subprocess.run(["rclone", "copyto", f"{remote}/fid_curve_results.json", tmp],
+                                capture_output=True, timeout=timeout)
+            if r.returncode == 0 and os.path.exists(tmp):
+                for k_, v_ in json.load(open(tmp)).items():
+                    merged.setdefault(k_, {}).update(v_)
+                os.remove(tmp)
+        except Exception:
+            pass
+    merged.setdefault(label, {})[str(step)] = fid
+    os.makedirs(out_dir, exist_ok=True)
+    json.dump(merged, open(local_path, "w"), indent=2)
+    return merged
+
+
 def compute_fid_with_error_analysis(gen_dir, out_dir, label, k=N_WORST_SAMPLES):
     """Like compute_fid, but keeps the generated images and ranks each one by its nearest-
     neighbor distance to the real Inception activation cloud -- a per-image proxy for "how
